@@ -66,7 +66,7 @@ def resolve(url: str) -> dict:
     """Ask yt-dlp for the stream's playable address. Raises NotLive if the channel is offline."""
     import yt_dlp
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "logger": _Quiet(),
-            "format": "b[height<=720]/bv*[height<=720]+ba/b"}
+            "format": "b[height<=720]/bv*[height<=720]+ba/b", **config.cookie_opts()}
     if media.is_youtube(url) and media.youtube_paused():
         raise NotLive(media.YT_BLOCKED)
     try:
@@ -801,6 +801,12 @@ def start_session(creator: dict, url=None) -> dict:
     jobs.save(job)
     Session(job, creator).start()
     return job
+
+
+def start_live_queue(url: str, creator_id: str = None, options: dict = None) -> dict:
+    """Start real-time live ingestion worker (60-second rolling chunks)."""
+    from . import live_queue
+    return live_queue.start_live_ingestion(url, creator_id=creator_id, options=options)
 
 
 def _watch_user(uid):

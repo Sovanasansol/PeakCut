@@ -9,7 +9,7 @@ import numpy as np
 
 from . import ai, config, games, usage, roman
 
-WINDOW_SEC, OVERLAP_SEC = 15 * 60, 60
+WINDOW_SEC, OVERLAP_SEC = 8 * 60, 30
 
 SCHEMA = {
     "type": "ARRAY",
@@ -147,7 +147,11 @@ def _same_word(old, new):
 
 
 def _overlaps(s, e, others):
-    return any(min(e, k["end"]) - max(s, k["start"]) > 0.3 * (e - s) for k in others)
+    for k in others:
+        overlap = min(e, k["end"]) - max(s, k["start"])
+        if overlap > 0.3 * (e - s) or overlap > 0.3 * (k["end"] - k["start"]) or abs(s - k["start"]) < 5.0:
+            return True
+    return False
 
 
 def make_lines(words, loud=None, chat=None):
@@ -276,11 +280,17 @@ def find_clips(words, db, duration, title="", uploader="", max_clips=6, min_len=
     if not lines:
         return [], {"model": None, "note": "No speech found."}
     found, used_model, tokens = [], None, 0
-    t = 0.0
     windows = []
-    while t < duration:
-        windows.append((t, min(duration, t + WINDOW_SEC)))
-        t += WINDOW_SEC - OVERLAP_SEC
+    if duration <= WINDOW_SEC:
+        windows.append((0.0, duration))
+    else:
+        t = 0.0
+        while t < duration:
+            end_t = min(duration, t + WINDOW_SEC)
+            windows.append((t, end_t))
+            if end_t >= duration:
+                break
+            t += WINDOW_SEC - OVERLAP_SEC
     per_window = max(2, min(8, int(np.ceil(max_clips * 1.5 / len(windows))) + 1))
     extra = _game_rules(game)
     for a, b in windows:

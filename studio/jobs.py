@@ -511,8 +511,8 @@ def _fetch_piece(job, clip, full_audio):
         clip.update(status="error", error=f"Could not fetch this part of the video: {safe.friendly(e, 250)}")
 
 
-BLOCK = 10 * 60         # long videos are transcribed and clipped one block at a time
-PROGRESSIVE_FROM = 20 * 60
+BLOCK = 8 * 60          # long videos are transcribed and clipped one block at a time
+PROGRESSIVE_FROM = 8 * 60
 
 
 def _covers(words: list, start: float, end: float) -> bool:

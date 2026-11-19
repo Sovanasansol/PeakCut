@@ -721,6 +721,13 @@ def create_from_link(body: dict = Body(...)):
     creator = str(body.get("creator") or "") or None
     if creator and not creators.get(creator):
         raise HTTPException(404, "No such creator")
+    if body.get("live") or (body.get("options") or {}).get("live") or url.startswith(("rtmp://", "rtmps://")):
+        from . import live_queue
+        try:
+            live_job = live_queue.start_live_ingestion(url, creator_id=creator, options=body.get("options") or {})
+            return jobs.public(live_job)
+        except Exception as e:
+            raise HTTPException(400, str(e))
     try:
         with _create_lock:
             _job_slots()
@@ -1219,8 +1226,25 @@ def go_live(cid: str, body: dict = Body(default={})):
         raise HTTPException(400, str(e))
 
 
+@app.post("/api/live/ingest")
+def live_ingest_route(body: dict = Body(...)):
+    _need_verified()
+    url = str(body.get("url", "")).strip()[:500]
+    if not url:
+        raise HTTPException(400, "URL is required.")
+    from . import live_queue
+    try:
+        live_job = live_queue.start_live_ingestion(url, creator_id=body.get("creator"), options=body.get("options") or {})
+        return jobs.public(live_job)
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
 @app.post("/api/live/{jid}/stop")
 def stop_live(jid: str):
+    from . import live_queue
+    if live_queue.stop_live_ingestion(jid):
+        return {"ok": True}
     s = live.mine(jid)
     if not s:
         raise HTTPException(404, "This recording has already ended")
@@ -1545,6 +1569,18 @@ def main():
     if not config.ACCOUNTS and (config.HTTPS or config.HOST not in ("127.0.0.1", "localhost", "::1")):
         print("  Sign-in is off, so anyone who can reach this address can use PeakCut and its AI key.\n"
               "  On a server other people can reach, set PEAKCUT_ACCOUNTS=1 in .env.\n", flush=True)
+    if "--live" in sys.argv:
+        idx = sys.argv.index("--live")
+        live_url = sys.argv[idx + 1] if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith("-") else None
+        if live_url:
+            print(f"  Starting real-time live ingestion for: {live_url}\n", flush=True)
+            from . import live_queue
+            def _run_live_cli():
+                time.sleep(1.0)
+                u = auth.local_user()
+                with ctx.as_user(u.id):
+                    live_queue.start_live_ingestion(live_url)
+            threading.Thread(target=_run_live_cli, daemon=True).start()
     if config.env("PEAKCUT_AUTO_RELOAD") == "1":
         # restart by itself whenever the server code changes (pages in web/ never need a restart)
         uvicorn.run("studio.server:app", host=config.HOST, port=config.PORT, log_level="warning", backlog=4096, reload=True,

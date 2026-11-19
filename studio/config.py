@@ -142,6 +142,40 @@ LIVE_AI_TIMEOUT = float(env("PEAKCUT_LIVE_AI_TIMEOUT", "45"))
 for d in (USERS_DIR, MODELS_DIR, TMP_DIR, FONTS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
+# ---------------------------------------------------------------- cookies for yt-dlp
+# YouTube sometimes refuses automated downloads ("sign in to confirm you're not a bot").
+# Supplying cookies (from a cookies.txt file or from a browser) lets yt-dlp download as an authenticated user.
+COOKIES_FILE = env("PEAKCUT_COOKIES_FILE", "")
+COOKIES_BROWSER = env("PEAKCUT_COOKIES_BROWSER", "").strip()
+
+
+def _has_cookies(path: Path) -> bool:
+    try:
+        if not path.is_file() or path.stat().st_size == 0:
+            return False
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def cookie_opts() -> dict:
+    """Options passed to yt-dlp so downloads can authenticate and bypass bot checks."""
+    if COOKIES_FILE:
+        p = Path(COOKIES_FILE)
+        if _has_cookies(p):
+            return {"cookiefile": str(p)}
+    for p in (DATA_DIR / "cookies.txt", ROOT / "cookies.txt"):
+        if _has_cookies(p):
+            return {"cookiefile": str(p)}
+    if COOKIES_BROWSER:
+        return {"cookiesfrombrowser": (COOKIES_BROWSER,)}
+    return {}
+
+
 
 def user_dir(uid: str) -> Path:
     if not re.fullmatch(r"[A-Za-z0-9_]{6,40}", uid or ""):

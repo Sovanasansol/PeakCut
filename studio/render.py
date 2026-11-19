@@ -1,9 +1,12 @@
 """Turns a time range into a vertical clip: 9:16 layout, bouncy word captions, hook title, cover."""
+import os
 import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+
+import numpy as np
 
 from . import config, roman
 from .media import NO_WINDOW, run
@@ -232,7 +235,78 @@ PIP_W = 380            # how wide the facecam is in the 1080-wide frame
 PIP_MARGIN = 26
 
 
-def _filter(layout, fg_h, facecam=None):
+def track_face_crop_x(src: Path, start: float, end: float, src_w: int, src_h: int) -> int:
+    """Lightweight face-tracking pass sampled every 10 frames with smoothed median horizontal
+    coordinates so active speakers stay centered in 1080x1920 instead of a blind static center crop."""
+    scale = max(W / max(1, src_w), H / max(1, src_h))
+    scaled_w = int(round(src_w * scale))
+    default_crop_x = max(0, min(scaled_w - W, (scaled_w - W) // 2))
+    if scaled_w <= W:
+        return 0
+
+    try:
+        import cv2
+    except ImportError:
+        return default_crop_x
+
+    cascade_path = getattr(cv2.data, "haarcascades", "") + "haarcascade_frontalface_default.xml"
+    if not os.path.isfile(cascade_path):
+        return default_crop_x
+
+    try:
+        classifier = cv2.CascadeClassifier(cascade_path)
+        if classifier.empty():
+            return default_crop_x
+    except Exception:
+        return default_crop_x
+
+    try:
+        cap = cv2.VideoCapture(str(src))
+        if not cap.isOpened():
+            return default_crop_x
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        start_frame = max(0, int(start * fps))
+        end_frame = max(start_frame + 1, int(end * fps))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+        centers = []
+        frame_idx = start_frame
+        while frame_idx < end_frame:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                break
+            if (frame_idx - start_frame) % 10 == 0:
+                fh, fw = frame.shape[:2]
+                if fw > 0 and fh > 0:
+                    tw = 320
+                    th = max(1, int(tw * fh / fw))
+                    small = cv2.resize(frame, (tw, th), interpolation=cv2.INTER_AREA)
+                    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                    faces = classifier.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(24, 24))
+                    if len(faces) > 0:
+                        largest = max(faces, key=lambda f: f[2] * f[3])
+                        fx, fy, fwb, fhb = largest
+                        cx = (fx + fwb / 2.0) / float(tw)
+                        centers.append(cx)
+            frame_idx += 1
+        cap.release()
+
+        if not centers:
+            return default_crop_x
+
+        med = float(np.median(centers))
+        inliers = [c for c in centers if abs(c - med) <= 0.25]
+        smoothed_median = float(np.median(inliers)) if inliers else med
+
+        target_x = smoothed_median * scaled_w - W / 2.0
+        crop_x = int(round(max(0.0, min(float(scaled_w - W), target_x))))
+        return crop_x
+    except Exception:
+        return default_crop_x
+
+
+def _filter(layout, fg_h, facecam=None, crop_x=None):
     if layout == "gameplay" and facecam:
         # The game fills the screen, and the webcam sits in the top corner of it, so a viewer sees
         # the play and the face at the same time.
@@ -244,7 +318,8 @@ def _filter(layout, fg_h, facecam=None):
                     f"[fc]crop={fw}:{fh}:{fx}:{fy},scale={PIP_W}:{pip_h},setsar=1[p];"
                     f"[b][p]overlay={W - PIP_W - PIP_MARGIN}:{PIP_MARGIN}[v0];")
     if layout == "crop" or (layout == "gameplay" and not facecam):
-        return f"[0:v]fps={config.OUT_FPS},scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1[v0];"
+        cx_arg = f":{crop_x}:(in_h-out_h)/2" if crop_x is not None else ""
+        return f"[0:v]fps={config.OUT_FPS},scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}{cx_arg},setsar=1[v0];"
     return (f"[0:v]fps={config.OUT_FPS},split=2[a][b];"
             f"[a]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,boxblur=6:2,"
             f"scale={W}:{H},eq=brightness=-0.14:saturation=1.15[bg];"
@@ -260,7 +335,7 @@ def _hook_y(layout, hook_y, facecam=None):
     return hook_y
 
 
-_qsv_ok = None
+_hw_enc_ok = {}
 RENDER_SECONDS = 600      # one clip's video encode; far beyond normal, so a frozen encoder is stopped, not waited on
 
 
@@ -273,6 +348,10 @@ def render_clip(src: Path, out_dir: Path, name: str, clip: dict, words: list, sr
     if layout == "gameplay" and not (face and len(face) == 4):
         layout = "crop"     # no webcam found: the game fills the screen, which is still the right shape
     hook_y = _hook_y(layout, hook_y, face)
+    crop_x = None
+    if layout in ("crop", "gameplay") and not face:
+        crop_x = track_face_crop_x(src, start, end, src_w, src_h)
+        clip["crop_x"] = crop_x
     ass = build_ass(words if clip.get("captions", True) else [], start, end, clip.get("hook", ""), clip.get("style", "bounce"),
                     clip.get("highlight_words", []), hook_y, cap_y)
     # The clip is made in a short work folder and moved into place afterwards. The caption step of ffmpeg cannot
@@ -281,36 +360,42 @@ def render_clip(src: Path, out_dir: Path, name: str, clip: dict, words: list, sr
     # break the filter syntax).
     work = Path(tempfile.mkdtemp(prefix="pk"))
     try:
-        return _render_in(work, src, out_dir, name, start, end, layout, fg_h, ass, face=face)
+        return _render_in(work, src, out_dir, name, start, end, layout, fg_h, ass, face=face, crop_x=crop_x)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _render_in(work: Path, src: Path, out_dir: Path, name: str, start, end, layout, fg_h, ass: str, face=None) -> dict:
-    global _qsv_ok
+def _render_in(work: Path, src: Path, out_dir: Path, name: str, start, end, layout, fg_h, ass: str, face=None, crop_x=None) -> dict:
+    global _hw_enc_ok
     (work / f"{name}.ass").write_text(ass, encoding="utf-8")
     (work / "f").mkdir()
     for f in config.FONTS_DIR.glob("*.ttf"):
         shutil.copyfile(f, work / "f" / f.name)
-    fc = _filter(layout, fg_h, face) + f"[v0]ass={name}.ass:fontsdir=f[v]"
+    fc = _filter(layout, fg_h, face, crop_x=crop_x) + f"[v0]ass={name}.ass:fontsdir=f[v]"
     base = ["ffmpeg", "-y", "-v", "error", "-ss", f"{start:.2f}", "-t", f"{end - start:.2f}", "-i", str(src),
             "-filter_complex", fc, "-map", "[v]", "-map", "0:a:0", "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
             "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-movflags", "+faststart", "-pix_fmt"]
     encoders = []
-    if _qsv_ok is not False:
+    # Hardware GPU acceleration (AMD AMF, NVIDIA NVENC, Intel QSV)
+    if _hw_enc_ok.get("amf") is not False:
+        encoders.append(("amf", ["yuv420p", "-c:v", "h264_amf", "-quality", "speed", "-rc", "cqp", "-qp_i", "22", "-qp_p", "24"]))
+    if _hw_enc_ok.get("nvenc") is not False:
+        encoders.append(("nvenc", ["yuv420p", "-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23"]))
+    if _hw_enc_ok.get("qsv") is not False:
         encoders.append(("qsv", ["nv12", "-c:v", "h264_qsv", "-global_quality", "23", "-preset", "fast"]))
+    # Universal CPU fallback
     encoders.append(("x264", ["yuv420p", "-c:v", "libx264", "-crf", "21", "-preset", "veryfast"]))
     err = None
     for label, enc in encoders:
         p = subprocess.run(base + enc + [f"{name}.mp4"], cwd=work, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", creationflags=NO_WINDOW, timeout=RENDER_SECONDS)
         if p.returncode == 0:
-            if label == "qsv":
-                _qsv_ok = True
+            if label != "x264":
+                _hw_enc_ok[label] = True
             break
         err = p.stderr[-1200:]
-        if label == "qsv":
-            _qsv_ok = False
+        if label != "x264":
+            _hw_enc_ok[label] = False
     else:
         raise RuntimeError(f"Render failed: {err}")
     cover_t = min(1.2, (end - start) / 2)

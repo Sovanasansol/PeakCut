@@ -19,8 +19,9 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # minutes, with a clear message, instead of each one waiting to fail. Then the next link simply tries again.
 YT_PAUSE = 600
 _yt_refused_until = 0.0
-YT_BLOCKED = ("YouTube isn't letting PeakCut download videos right now. Upload the video file instead, or use a "
-              "Twitch or Kick link. YouTube links will be tried again in a few minutes.")
+_had_cookies = False
+YT_BLOCKED = ("YouTube isn't letting PeakCut download videos right now. Add your YouTube cookies to data/cookies.txt, "
+              "upload the video file instead, or use a Twitch or Kick link. YouTube links will be tried again in a few minutes.")
 _BOT_CHECK = re.compile(r"not a bot|confirm you.?re not|sign in to confirm(?! your age)", re.I)
 
 
@@ -35,7 +36,18 @@ def is_youtube(url: str) -> bool:
 
 
 def youtube_paused() -> bool:
+    global _had_cookies, _yt_refused_until
+    has_cookies = bool(config.cookie_opts())
+    if has_cookies and not _had_cookies:
+        _yt_refused_until = 0.0
+    _had_cookies = has_cookies
     return time.time() < _yt_refused_until
+
+
+def reset_youtube_pause():
+    """Clear the cooldown timer so YouTube downloads can be retried immediately."""
+    global _yt_refused_until
+    _yt_refused_until = 0.0
 
 
 def check_youtube(url: str):
@@ -73,6 +85,8 @@ def site_allowed(url: str) -> bool:
         u = urlparse(url.strip())
     except ValueError:
         return False
+    if u.scheme in ("rtmp", "rtmps") and bool(u.hostname or u.netloc):
+        return True
     host = (u.hostname or "").lower()
     return u.scheme in ("http", "https") and any(host == s or host.endswith("." + s) for s in config.ALLOWED_SITES)
 
@@ -100,7 +114,7 @@ def _ydl(opts):
     # a channel or playlist link is answered as "a list" straight away, never walked video by video
     return yt_dlp.YoutubeDL({"noplaylist": True, "quiet": True, "no_warnings": True, "logger": _Quiet(),
                              "extract_flat": "in_playlist", "playlistend": 1, "socket_timeout": 20,
-                             "concurrent_fragment_downloads": 4, **opts})
+                             "concurrent_fragment_downloads": 4, **config.cookie_opts(), **opts})
 
 
 def _video_format(height):

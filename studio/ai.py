@@ -176,6 +176,7 @@ def test() -> dict:
     if not ready():
         raise ValueError("Save a service, a model and a key first.")
     out, sent, wrote = call(ms[0], 'Answer with a JSON array that holds the single string "ok".', {"type": "ARRAY", "items": {"type": "STRING"}})
+    clear_problem()
     return {"ok": True, "model": ms[0], "tokens": sent + wrote, "answer": str(out)[:80]}
 
 
@@ -341,6 +342,9 @@ def see(prompt: str, image: bytes, timeout: float | None = None) -> tuple[str, i
     body = {"model": model, "stream": False, "messages": [{"role": "user", "content": [
         {"type": "text", "text": prompt},
         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}}]}]}
+    if provider() == "ollama":
+        body["options"] = {"num_ctx": 8192, "temperature": 0.2}
+        body["keep_alive"] = "60m"
     r = httpx.post(f"{base_url()}/chat/completions", json=body, headers=headers, timeout=timeout or 120)
     if r.status_code != 200:
         _fail(r, model)
@@ -417,11 +421,17 @@ def _from_events(text: str) -> dict:
 def _openai(model, prompt, schema, timeout=None):
     headers = {"Authorization": f"Bearer {key()}"} if key() else {}
     body = {"model": model, "messages": [{"role": "user", "content": _wrapped(prompt, schema)}], "stream": False}
-    # Most services accept these two extras; a few models refuse one of them, so they are dropped on a refusal.
-    extras = [{"temperature": 0.4, "response_format": {"type": "json_object"}}, {"response_format": {"type": "json_object"}}, {}]
+    if provider() == "ollama":
+        body["options"] = {"num_ctx": 8192, "temperature": 0.2}
+        body["keep_alive"] = "60m"
+        extras = [{"response_format": {"type": "json_object"}}, {}]
+    else:
+        # Most services accept these two extras; a few models refuse one of them, so they are dropped on a refusal.
+        extras = [{"temperature": 0.4, "response_format": {"type": "json_object"}}, {"response_format": {"type": "json_object"}}, {}]
     r = None
+    timeout = timeout or (600 if provider() in ("ollama", "custom") else 180)
     for extra in extras:
-        r = httpx.post(f"{base_url()}/chat/completions", json={**body, **extra}, headers=headers, timeout=timeout or 180)
+        r = httpx.post(f"{base_url()}/chat/completions", json={**body, **extra}, headers=headers, timeout=timeout)
         if r.status_code not in (400, 422):
             break
     if r.status_code != 200:
